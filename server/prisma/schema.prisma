@@ -1,0 +1,159 @@
+generator client {
+  provider = "prisma-client-js"
+}
+datasource db {
+  provider = "postgresql"
+  url = env("DATABASE_URL")
+}
+enum Role {
+  ADMIN
+  STUDENT
+}
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+}
+enum Difficulty {
+  EASY
+  MEDIUM
+  HARD
+}
+enum QuizStatus {
+  DRAFT
+  PUBLISHED
+  UNPUBLISHED
+}
+enum AttemptStatus {
+  IN_PROGRESS
+  COMPLETED
+  PASSED
+  FAILED
+  EXPIRED
+}
+enum TimerMode {
+  PER_QUESTION
+  FULL_QUIZ
+  NONE
+}
+enum QuestionAnswerType {
+  SINGLE_CHOICE
+  MULTIPLE_CHOICE
+}
+model User {
+  id String @id @default(cuid())
+  name String
+  email String @unique
+  passwordHash String
+  role Role @default(STUDENT)
+  status UserStatus @default(ACTIVE)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  attempts Attempt[]
+}
+model Category {
+  id String @id @default(cuid())
+  name String @unique
+  description String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  quizzes Quiz[]
+}
+model Quiz {
+  id String @id @default(cuid())
+  title String
+  description String
+  categoryId String
+  category Category @relation(fields: [categoryId], references: [id])
+  difficulty Difficulty
+  duration Int
+  timerMode TimerMode @default(FULL_QUIZ)
+  questionAnswerType QuestionAnswerType @default(SINGLE_CHOICE)
+  passingScore Float
+  maxAttempts Int
+  status QuizStatus @default(DRAFT)
+  thumbnail String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  questions Question[]
+  attempts Attempt[]
+}
+model Question {
+  id String @id @default(cuid())
+  quizId String
+  quiz Quiz @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  questionText String
+  marks Float @default(1)
+  explanation String?
+  questionTimeLimit Int?
+  difficulty Difficulty @default(MEDIUM)
+  sourceCategory String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  options Option[]
+  answers Answer[]
+  attemptQuestions AttemptQuestion[]
+}
+model Option {
+  id String @id @default(cuid())
+  questionId String
+  question Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  optionText String
+  isCorrect Boolean
+  selectedAnswers Answer[]
+  answerSelections AnswerSelection[]
+}
+model Attempt {
+  id String @id @default(cuid())
+  quizId String
+  quiz Quiz @relation(fields: [quizId], references: [id])
+  userId String
+  user User @relation(fields: [userId], references: [id])
+  score Float @default(0)
+  percentage Float @default(0)
+  correctAnswers Int @default(0)
+  incorrectAnswers Int @default(0)
+  unanswered Int @default(0)
+  totalMarks Float @default(0)
+  obtainedMarks Float @default(0)
+  timeTaken Int @default(0)
+  status AttemptStatus @default(IN_PROGRESS)
+  startedAt DateTime @default(now())
+  expiresAt DateTime
+  completedAt DateTime?
+  currentQuestion Int @default(0)
+  currentQuestionStartedAt DateTime?
+  currentQuestionExpiresAt DateTime?
+  answers Answer[]
+  attemptQuestions AttemptQuestion[]
+  @@index([userId, quizId])
+}
+model AttemptQuestion {
+  id String @id @default(cuid())
+  attemptId String
+  attempt Attempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  questionId String
+  question Question @relation(fields: [questionId], references: [id])
+  position Int
+  @@unique([attemptId, questionId])
+  @@unique([attemptId, position])
+}
+model Answer {
+  id String @id @default(cuid())
+  attemptId String
+  attempt Attempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  questionId String
+  question Question @relation(fields: [questionId], references: [id])
+  selectedOptionId String?
+  selectedOption Option? @relation(fields: [selectedOptionId], references: [id])
+  isCorrect Boolean @default(false)
+  selections AnswerSelection[]
+  @@unique([attemptId, questionId])
+}
+model AnswerSelection {
+  id String @id @default(cuid())
+  answerId String
+  answer Answer @relation(fields: [answerId], references: [id], onDelete: Cascade)
+  optionId String
+  option Option @relation(fields: [optionId], references: [id])
+  @@unique([answerId, optionId])
+}
