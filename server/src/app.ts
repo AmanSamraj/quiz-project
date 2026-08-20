@@ -1,0 +1,1816 @@
+import 'dotenv/config';
+
+import express, {
+  NextFunction,
+  Request,
+  Response
+} from 'express';
+
+import {
+  PrismaClient,
+  Role,
+  QuizStatus,
+  AttemptStatus
+} from '@prisma/client';
+
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import { z } from 'zod';
+
+
+// ======================================================
+// DATABASE + EXPRESS APP
+// ======================================================
+
+const db: any = new PrismaClient();
+const app = express();
+
+const secret = process.env.JWT_SECRET;
+
+if (!secret) {
+  throw new Error('JWT_SECRET environment variable is required');
+}
+
+
+// ======================================================
+// MIDDLEWARE
+// ======================================================
+
+app.use(helmet());
+
+app.use(
+  cors({
+    origin: process.env.FRONTEND_URL || 'http://localhost:5173'
+  })
+);
+
+app.use(express.json());
+
+app.use(
+  '/api/auth',
+  rateLimit({
+    windowMs: 15 * 60_000,
+    max: 100
+  })
+);
+
+
+// ======================================================
+// TYPES + HELPERS
+// ======================================================
+
+type AuthRequest = Request & {
+  user?: {
+    id: string;
+    role: Role;
+  };
+};
+
+const safe = (u: any) => ({
+  id: u.id,
+  name: u.name,
+  email: u.email,
+  role: u.role,
+  status: u.status,
+  createdAt: u.createdAt
+});
+
+const token = (u: any) =>
+  jwt.sign(
+    {
+      id: u.id,
+      role: u.role
+    },
+    secret,
+    {
+      expiresIn: process.env.JWT_EXPIRES_IN || '7d'
+    } as jwt.SignOptions
+  );
+
+
+// ======================================================
+// AUTH MIDDLEWARE
+// ======================================================
+
+function auth(
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+) {
+  try {
+    const t = req.headers.authorization?.replace(
+      'Bearer ',
+      ''
+    );
+
+    if (!t) throw new Error('No token');
+
+    req.user = jwt.verify(t, secret) as any;
+
+    next();
+  } catch {
+    res.status(401).json({
+      success: false,
+      message: 'Authentication required'
+    });
+  }
+}
+
+
+const role =
+  (r: Role) =>
+  (
+    req: AuthRequest,
+    res: Response,
+    next: NextFunction
+  ) =>
+    req.user?.role === r
+      ? next()
+      : res.status(403).json({
+          success: false,
+          message: 'Insufficient permissions'
+        });
+
+
+// ======================================================
+// RESPONSE HELPERS
+// ======================================================
+
+const ok = (
+  res: Response,
+  data: any = {},
+  message = 'OK',
+  status = 200
+) =>
+  res.status(status).json({
+    success: true,
+    message,
+    data
+  });
+
+const fail = (
+  res: Response,
+  message: string,
+  status = 400,
+  errors?: any
+) =>
+  res.status(status).json({
+    success: false,
+    message,
+    errors
+  });
+
+
+// ======================================================
+// AUTH ROUTES
+// ======================================================
+
+app.post(
+  '/api/auth/register',
+  async (req, res, next) => {
+    try {
+      const v = z
+        .object({
+          name: z.string().min(1),
+          email: z.string().email(),
+          password: z.string().min(8)
+        })
+        .parse(req.body);
+
+      if (
+        await db.user.findUnique({
+          where: {
+            email: v.email
+          }
+        })
+      ) {
+        return fail(
+          res,
+          'Email already registered',
+          409
+        );
+      }
+
+      const u = await db.user.create({
+        data: {
+          name: v.name,
+          email: v.email,
+          passwordHash: await bcrypt.hash(
+            v.password,
+            12
+          )
+        }
+      });
+
+      ok(
+        res,
+        {
+          user: safe(u),
+          token: token(u)
+        },
+        'Registration successful',
+        201
+      );
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+
+app.post(
+  '/api/auth/login',
+  async (req, res, next) => {
+    try {
+      const v = z
+        .object({
+          email: z.string().email(),
+          password: z.string().min(1)
+        })
+        .parse(req.body);
+
+      const u = await db.user.findUnique({
+        where: {
+          email: v.email
+        }
+      });
+
+      if (
+        !u ||
+        !(await bcrypt.compare(
+          v.password,
+          u.passwordHash
+        ))
+      ) {
+        return fail(
+          res,
+          'Invalid email or password.',
+          401
+        );
+      }
+
+      if (u.status === 'INACTIVE') {
+        return fail(
+          res,
+          'Your account has been deactivated.',
+          403
+        );
+      }
+
+      ok(
+        res,
+        {
+          user: safe(u),
+          token: token(u)
+        },
+        'Login successful'
+      );
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+
+app.get(
+  '/api/auth/me',
+  auth,
+  async (req: AuthRequest, res) => {
+    const u = await db.user.findUnique({
+      where: {
+        id: req.user!.id
+      }
+    });
+
+    u
+      ? ok(res, { user: safe(u) })
+      : fail(res, 'User not found', 404);
+  }
+);
+
+
+app.post(
+  '/api/auth/logout',
+  (_q, res) =>
+    ok(res, {}, 'Logged out')
+);
+
+
+// ======================================================
+// CATEGORY ROUTES
+// ======================================================
+
+app.get(
+  '/api/categories',
+  async (_q, res) =>
+    ok(
+      res,
+      {
+        items: await db.category.findMany({
+          orderBy: {
+            name: 'asc'
+          }
+        })
+      }
+    )
+);
+
+
+app.post(
+  '/api/categories',
+  auth,
+  role(Role.ADMIN),
+  async (req, res, next) => {
+    try {
+      ok(
+        res,
+        await db.category.create({
+          data: z
+            .object({
+              name: z.string().min(2),
+              description: z.string().optional()
+            })
+            .parse(req.body)
+        }),
+        'Category created',
+        201
+      );
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+
+app.put(
+  '/api/categories/:id',
+  auth,
+  role(Role.ADMIN),
+  async (req, res, next) => {
+    try {
+      ok(
+        res,
+        await db.category.update({
+          where: {
+            id: req.params.id
+          },
+          data: z
+            .object({
+              name: z.string().min(2),
+              description: z.string().optional()
+            })
+            .parse(req.body)
+        }),
+        'Category updated'
+      );
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+
+app.delete(
+  '/api/categories/:id',
+  auth,
+  role(Role.ADMIN),
+  async (req, res, next) => {
+    try {
+      await db.category.delete({
+        where: {
+          id: req.params.id
+        }
+      });
+
+      ok(res, {}, 'Category deleted');
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+
+// ======================================================
+// QUIZ ROUTES
+// ======================================================
+
+app.get(
+  '/api/quizzes',
+  async (req, res) => {
+    const q = req.query;
+
+    const where: any = {
+      status:
+        q.admin === 'true'
+          ? undefined
+          : QuizStatus.PUBLISHED,
+
+      title: q.search
+        ? {
+            contains: String(q.search),
+            mode: 'insensitive'
+          }
+        : undefined,
+
+      categoryId: q.category
+        ? String(q.category)
+        : undefined,
+
+      difficulty: q.difficulty
+        ? String(q.difficulty)
+        : undefined
+    };
+
+    const [items, total] =
+      await Promise.all([
+        db.quiz.findMany({
+          where,
+          include: {
+            category: true,
+            _count: {
+              select: {
+                questions: true,
+                attempts: true
+              }
+            }
+          },
+          orderBy: {
+            createdAt: 'desc'
+          }
+        }),
+
+        db.quiz.count({
+          where
+        })
+      ]);
+
+    ok(res, {
+      items,
+      total
+    });
+  }
+);
+
+
+app.get(
+  '/api/quizzes/:id',
+  async (req, res) => {
+    const q =
+      await db.quiz.findUnique({
+        where: {
+          id: req.params.id
+        },
+        include: {
+          category: true,
+          _count: {
+            select: {
+              questions: true,
+              attempts: true
+            }
+          }
+        }
+      });
+
+    q
+      ? ok(res, q)
+      : fail(
+          res,
+          'Quiz not found',
+          404
+        );
+  }
+);
+
+
+// ======================================================
+// QUIZ CRUD
+// ======================================================
+
+const quizSchema = z.object({
+  title: z.string().min(3),
+  description: z.string().min(3),
+  categoryId: z.string(),
+
+  difficulty: z.enum([
+    'EASY',
+    'MEDIUM',
+    'HARD'
+  ]),
+
+  duration: z.number().int().positive(),
+
+  passingScore: z
+    .number()
+    .min(0)
+    .max(100),
+
+  maxAttempts: z
+    .number()
+    .int()
+    .positive(),
+
+  status: z
+    .enum([
+      'DRAFT',
+      'PUBLISHED',
+      'UNPUBLISHED'
+    ])
+    .optional(),
+
+  thumbnail: z
+    .string()
+    .url()
+    .optional()
+    .nullable()
+});
+
+
+app.post(
+  '/api/quizzes',
+  auth,
+  role(Role.ADMIN),
+  async (req, res, next) => {
+    try {
+      ok(
+        res,
+        await db.quiz.create({
+          data: quizSchema.parse(
+            req.body
+          )
+        }),
+        'Quiz created',
+        201
+      );
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+
+app.put(
+  '/api/quizzes/:id',
+  auth,
+  role(Role.ADMIN),
+  async (req, res, next) => {
+    try {
+      ok(
+        res,
+        await db.quiz.update({
+          where: {
+            id: req.params.id
+          },
+          data: quizSchema
+            .partial()
+            .parse(req.body)
+        }),
+        'Quiz updated'
+      );
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+
+app.patch(
+  '/api/quizzes/:id/publish',
+  auth,
+  role(Role.ADMIN),
+  async (req, res, next) => {
+    try {
+      const status =
+        z
+          .object({
+            status: z.enum([
+              'DRAFT',
+              'PUBLISHED',
+              'UNPUBLISHED'
+            ])
+          })
+          .parse(req.body)
+          .status;
+
+      ok(
+        res,
+        await db.quiz.update({
+          where: {
+            id: req.params.id
+          },
+          data: {
+            status
+          }
+        }),
+        'Quiz status updated'
+      );
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+
+app.delete(
+  '/api/quizzes/:id',
+  auth,
+  role(Role.ADMIN),
+  async (req, res, next) => {
+    try {
+      const count =
+        await db.attempt.count({
+          where: {
+            quizId: req.params.id
+          }
+        });
+
+      if (count)
+        return fail(
+          res,
+          'Cannot delete a quiz with attempts',
+          409
+        );
+
+      await db.quiz.delete({
+        where: {
+          id: req.params.id
+        }
+      });
+
+      ok(res, {}, 'Quiz deleted');
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+
+// ======================================================
+// QUESTION ROUTES
+// ======================================================
+
+app.get(
+  '/api/quizzes/:quizId/questions',
+  auth,
+  role(Role.ADMIN),
+  async (req, res) =>
+    ok(
+      res,
+      {
+        items:
+          await db.question.findMany({
+            where: {
+              quizId: req.params.quizId
+            },
+            include: {
+              options: true
+            }
+          })
+      }
+    )
+);
+
+
+const questionSchema = z
+  .object({
+    questionText: z.string().min(3),
+
+    marks: z
+      .number()
+      .positive(),
+
+    explanation:
+      z.string().optional(),
+
+    difficulty: z
+      .enum([
+        'EASY',
+        'MEDIUM',
+        'HARD'
+      ])
+      .optional(),
+
+    options: z
+      .array(
+        z.object({
+          optionText:
+            z.string().min(1),
+
+          isCorrect:
+            z.boolean()
+        })
+      )
+      .min(2)
+      .refine(
+        x =>
+          x.filter(
+            o => o.isCorrect
+          ).length === 1,
+        'Exactly one correct option is required'
+      )
+  });
+
+
+app.post(
+  '/api/quizzes/:quizId/questions',
+  auth,
+  role(Role.ADMIN),
+  async (req, res, next) => {
+    try {
+      const v =
+        questionSchema.parse(
+          req.body
+        );
+
+      ok(
+        res,
+        await db.question.create({
+          data: {
+            ...v,
+            quizId:
+              req.params.quizId,
+
+            options: {
+              create: v.options
+            }
+          }
+        }),
+        'Question created',
+        201
+      );
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+
+app.delete(
+  '/api/questions/:id',
+  auth,
+  role(Role.ADMIN),
+  async (req, res) => {
+    await db.question.delete({
+      where: {
+        id: req.params.id
+      }
+    });
+
+    ok(
+      res,
+      {},
+      'Question deleted'
+    );
+  }
+);
+
+
+// ======================================================
+// STUDENT QUIZ
+// ======================================================
+
+app.post(
+  '/api/quizzes/:quizId/start',
+  auth,
+  role(Role.STUDENT),
+  async (
+    req: AuthRequest,
+    res,
+    next
+  ) => {
+    try {
+      const quiz =
+        await db.quiz.findUnique({
+          where: {
+            id: req.params.quizId
+          },
+
+          include: {
+            _count: {
+              select: {
+                questions: true
+              }
+            }
+          }
+        });
+
+      if (
+        !quiz ||
+        quiz.status !==
+          QuizStatus.PUBLISHED
+      ) {
+        return fail(
+          res,
+          'Quiz is no longer available.',
+          404
+        );
+      }
+
+      if (!quiz._count.questions) {
+        return fail(
+          res,
+          'Quiz has no questions'
+        );
+      }
+
+      const done =
+        await db.attempt.count({
+          where: {
+            quizId: quiz.id,
+            userId: req.user!.id,
+
+            status: {
+              not:
+                AttemptStatus.IN_PROGRESS
+            }
+          }
+        });
+
+      if (
+        done >= quiz.maxAttempts
+      ) {
+        return fail(
+          res,
+          'You have reached the maximum number of attempts.',
+          409
+        );
+      }
+
+      const now = new Date();
+
+      const attempt =
+        await db.attempt.create({
+          data: {
+            quizId: quiz.id,
+            userId: req.user!.id,
+
+            expiresAt:
+              new Date(
+                now.getTime() +
+                  quiz.duration *
+                    60000
+              )
+          }
+        });
+
+      ok(
+        res,
+        attempt,
+        'Quiz started',
+        201
+      );
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+
+// ======================================================
+// ATTEMPTS
+// ======================================================
+
+app.get(
+  '/api/attempts/:id/take',
+  auth,
+  role(Role.STUDENT),
+  async (
+    req: AuthRequest,
+    res
+  ) => {
+    const a =
+      await db.attempt.findFirst({
+        where: {
+          id: req.params.id,
+          userId: req.user!.id
+        },
+
+        include: {
+          quiz: {
+            include: {
+              questions: {
+                include: {
+                  options: {
+                    select: {
+                      id: true,
+                      optionText:
+                        true
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      });
+
+    if (!a)
+      return fail(
+        res,
+        'Attempt not found',
+        404
+      );
+
+    ok(res, a);
+  }
+);
+
+
+app.post(
+  '/api/quizzes/:quizId/submit',
+  auth,
+  role(Role.STUDENT),
+  async (
+    req: AuthRequest,
+    res,
+    next
+  ) => {
+    try {
+      const v = z
+        .object({
+          attemptId: z.string(),
+
+          answers: z.array(
+            z.object({
+              questionId:
+                z.string(),
+
+              selectedOptionId:
+                z
+                  .string()
+                  .nullable()
+                  .optional()
+            })
+          )
+        })
+        .parse(req.body);
+
+      const result =
+        await db.$transaction(
+          async (tx: any) => {
+            const a =
+              await tx.attempt.findFirst({
+                where: {
+                  id: v.attemptId,
+                  quizId:
+                    req.params.quizId,
+                  userId:
+                    req.user!.id
+                },
+
+                include: {
+                  quiz: {
+                    include: {
+                      questions: {
+                        include: {
+                          options: true
+                        }
+                      }
+                    }
+                  }
+                }
+              });
+
+            if (!a)
+              throw new Error(
+                'Attempt not found'
+              );
+
+            if (
+              a.status !==
+              AttemptStatus.IN_PROGRESS
+            )
+              throw new Error(
+                'Attempt already submitted'
+              );
+
+            const expired =
+              a.expiresAt <
+              new Date();
+
+            const questions =
+              a.quiz.questions;
+
+            const map = new Map(
+              v.answers.map(x => [
+                x.questionId,
+                x.selectedOptionId
+              ])
+            );
+
+            let correct = 0;
+            let incorrect = 0;
+            let unanswered = 0;
+            let marks = 0;
+            let total = 0;
+
+            for (
+              const q of questions
+            ) {
+              total += q.marks;
+
+              const chosen =
+                map.get(q.id);
+
+              const right =
+                q.options.find(
+                  (o: any) =>
+                    o.isCorrect
+                );
+
+              const good =
+                !!chosen &&
+                chosen === right?.id;
+
+              if (!chosen)
+                unanswered++;
+              else if (good) {
+                correct++;
+                marks += q.marks;
+              } else {
+                incorrect++;
+              }
+
+              await tx.answer.upsert({
+                where: {
+                  attemptId_questionId:
+                    {
+                      attemptId:
+                        a.id,
+                      questionId:
+                        q.id
+                    }
+                },
+
+                create: {
+                  attemptId:
+                    a.id,
+                  questionId:
+                    q.id,
+                  selectedOptionId:
+                    chosen || null,
+                  isCorrect: good
+                },
+
+                update: {
+                  selectedOptionId:
+                    chosen || null,
+                  isCorrect: good
+                }
+              });
+            }
+
+            const percentage =
+              total
+                ? (marks / total) *
+                  100
+                : 0;
+
+            const status =
+              expired
+                ? AttemptStatus.EXPIRED
+                : percentage >=
+                  a.quiz
+                    .passingScore
+                ? AttemptStatus.PASSED
+                : AttemptStatus.FAILED;
+
+            return tx.attempt.update({
+              where: {
+                id: a.id
+              },
+
+              data: {
+                correctAnswers:
+                  correct,
+
+                incorrectAnswers:
+                  incorrect,
+
+                unanswered,
+
+                totalMarks:
+                  total,
+
+                obtainedMarks:
+                  marks,
+
+                score: marks,
+
+                percentage,
+
+                status,
+
+                timeTaken:
+                  Math.floor(
+                    (Date.now() -
+                      a.startedAt.getTime()) /
+                      1000
+                  ),
+
+                completedAt:
+                  new Date()
+              },
+
+              include: {
+                quiz: true
+              }
+            });
+          }
+        );
+
+      ok(
+        res,
+        result,
+        'Quiz submitted'
+      );
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+
+app.get(
+  '/api/attempts',
+  auth,
+  role(Role.STUDENT),
+  async (
+    req: AuthRequest,
+    res
+  ) =>
+    ok(res, {
+      items:
+        await db.attempt.findMany({
+          where: {
+            userId:
+              req.user!.id,
+
+            status: {
+              not:
+                AttemptStatus.IN_PROGRESS
+            }
+          },
+
+          include: {
+            quiz: true
+          },
+
+          orderBy: {
+            startedAt: 'desc'
+          }
+        })
+    })
+);
+
+
+app.get(
+  '/api/attempts/:id',
+  auth,
+  async (
+    req: AuthRequest,
+    res
+  ) => {
+    const a =
+      await db.attempt.findUnique({
+        where: {
+          id: req.params.id
+        },
+
+        include: {
+          quiz: true,
+
+          answers: {
+            include: {
+              question: {
+                include: {
+                  options: true
+                }
+              },
+
+              selectedOption:
+                true
+            }
+          }
+        }
+      });
+
+    if (
+      !a ||
+      (
+        req.user!.role !==
+          Role.ADMIN &&
+        a.userId !==
+          req.user!.id
+      )
+    ) {
+      return fail(
+        res,
+        'Attempt not found',
+        404
+      );
+    }
+
+    ok(res, a);
+  }
+);
+
+
+// ======================================================
+// ADMIN ANALYTICS
+// ======================================================
+
+app.get(
+  '/api/admin/analytics',
+  auth,
+  role(Role.ADMIN),
+  async (_q, res) => {
+    const [
+      students,
+      quizzes,
+      questions,
+      attempts,
+      passed
+    ] = await Promise.all([
+      db.user.count({
+        where: {
+          role: Role.STUDENT
+        }
+      }),
+
+      db.quiz.count(),
+
+      db.question.count(),
+
+      db.attempt.findMany({
+        where: {
+          status: {
+            in: [
+              AttemptStatus.PASSED,
+              AttemptStatus.FAILED
+            ]
+          }
+        },
+
+        select: {
+          percentage: true,
+          status: true
+        }
+      }),
+
+      db.attempt.count({
+        where: {
+          status:
+            AttemptStatus.PASSED
+        }
+      })
+    ]);
+
+    ok(res, {
+      totalStudents:
+        students,
+
+      totalQuizzes:
+        quizzes,
+
+      totalQuestions:
+        questions,
+
+      totalAttempts:
+        attempts.length,
+
+      averageScore:
+        attempts.length
+          ? attempts.reduce(
+              (s, a) =>
+                s + a.percentage,
+              0
+            ) /
+            attempts.length
+          : 0,
+
+      passRate:
+        attempts.length
+          ? (passed /
+              attempts.length) *
+            100
+          : 0
+    });
+  }
+);
+
+
+// ======================================================
+// LEADERBOARD
+// ======================================================
+
+app.get(
+  '/api/leaderboard',
+  async (_q, res) => {
+    const rows =
+      await db.user.findMany({
+        where: {
+          role: Role.STUDENT
+        },
+
+        select: {
+          id: true,
+          name: true,
+
+          attempts: {
+            where: {
+              status: {
+                in: [
+                  AttemptStatus.PASSED,
+                  AttemptStatus.FAILED
+                ]
+              }
+            },
+
+            select: {
+              percentage: true
+            }
+          }
+        }
+      });
+
+    ok(res, {
+      items: rows
+        .map((u: any) => ({
+          id: u.id,
+          name: u.name,
+
+          quizzesCompleted:
+            u.attempts.length,
+
+          averageScore:
+            u.attempts.length
+              ? u.attempts.reduce(
+                  (
+                    s: number,
+                    a: any
+                  ) =>
+                    s +
+                    a.percentage,
+                  0
+                ) /
+                u.attempts.length
+              : 0
+        }))
+        .sort(
+          (a: any, b: any) =>
+            b.averageScore -
+            a.averageScore
+        )
+    });
+  }
+);
+
+
+// ======================================================
+// QUIZ BUILDER
+// ======================================================
+
+const builderQuestion =
+  z.object({
+    questionText:
+      z.string().min(3),
+
+    marks:
+      z.number().positive(),
+
+    explanation:
+      z.string().min(1),
+
+    questionTimeLimit:
+      z
+        .number()
+        .int()
+        .min(5)
+        .max(3600)
+        .nullable()
+        .optional(),
+
+    options:
+      z
+        .array(
+          z.object({
+            optionText:
+              z.string().min(1),
+
+            isCorrect:
+              z.boolean()
+          })
+        )
+        .length(4)
+  });
+
+
+const builderQuiz =
+  z.object({
+    title:
+      z.string().min(3),
+
+    description:
+      z.string().min(3),
+
+    categoryId:
+      z.string(),
+
+    difficulty:
+      z.enum([
+        'EASY',
+        'MEDIUM',
+        'HARD'
+      ]),
+
+    timerMode:
+      z.enum([
+        'PER_QUESTION',
+        'FULL_QUIZ',
+        'NONE'
+      ]),
+
+    questionAnswerType:
+      z.enum([
+        'SINGLE_CHOICE',
+        'MULTIPLE_CHOICE'
+      ]),
+
+    duration:
+      z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+  });
+
+
+function validateBuilderQuestions(
+  questions: any[],
+  type: string,
+  timer: string
+) {
+  if (questions.length !== 10)
+    throw new Error(
+      'A topic must contain exactly 10 questions.'
+    );
+
+  for (
+    const q of questions
+  ) {
+    const n =
+      q.options.filter(
+        (o: any) =>
+          o.isCorrect
+      ).length;
+
+    if (
+      type ===
+        'SINGLE_CHOICE' &&
+      n !== 1
+    ) {
+      throw new Error(
+        'Single-choice questions require exactly one correct option.'
+      );
+    }
+
+    if (
+      type ===
+        'MULTIPLE_CHOICE' &&
+      n < 2
+    ) {
+      throw new Error(
+        'Multiple-choice questions require at least two correct options.'
+      );
+    }
+
+    if (
+      timer ===
+        'PER_QUESTION' &&
+      (
+        !q.questionTimeLimit ||
+        q.questionTimeLimit < 5 ||
+        q.questionTimeLimit >
+          3600
+      )
+    ) {
+      throw new Error(
+        'Every per-question timer must be between 5 and 3600 seconds.'
+      );
+    }
+  }
+}
+
+
+// ======================================================
+// ADMIN QUIZ BUILDER ROUTES
+// ======================================================
+
+app.post(
+  '/api/admin/quizzes',
+  auth,
+  role(Role.ADMIN),
+  async (
+    req,
+    res,
+    next
+  ) => {
+    try {
+      const v =
+        builderQuiz.parse(
+          req.body
+        );
+
+      const quiz =
+        await db.quiz.create({
+          data: {
+            ...v,
+
+            duration:
+              v.timerMode ===
+              'NONE'
+                ? 0
+                : v.duration || 10,
+
+            status: 'DRAFT'
+          }
+        });
+
+      ok(
+        res,
+        quiz,
+        'Topic draft created',
+        201
+      );
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+
+app.post(
+  '/api/admin/quizzes/:quizId/questions/bulk',
+  auth,
+  role(Role.ADMIN),
+  async (
+    req,
+    res,
+    next
+  ) => {
+    try {
+      const questions =
+        z.array(
+          builderQuestion
+        )
+        .length(10)
+        .parse(
+          req.body.questions
+        );
+
+      const quiz =
+        await db.quiz.findUnique({
+          where: {
+            id: req.params.quizId
+          }
+        });
+
+      if (!quiz)
+        return fail(
+          res,
+          'Quiz not found',
+          404
+        );
+
+      validateBuilderQuestions(
+        questions,
+        quiz.questionAnswerType,
+        quiz.timerMode
+      );
+
+      const result =
+        await db.$transaction(
+          async (tx: any) => {
+            const existing =
+              await tx.question.count({
+                where: {
+                  quizId: quiz.id
+                }
+              });
+
+            if (existing) {
+              return Promise.reject(
+                new Error(
+                  'Questions already exist. Create a new topic or remove the existing questions first.'
+                )
+              );
+            }
+
+            for (
+              const q of questions
+            ) {
+              await tx.question.create({
+                data: {
+                  quizId: quiz.id,
+
+                  questionText:
+                    q.questionText,
+
+                  marks: q.marks,
+
+                  explanation:
+                    q.explanation,
+
+                  questionTimeLimit:
+                    quiz.timerMode ===
+                    'PER_QUESTION'
+                      ? q.questionTimeLimit
+                      : null,
+
+                  options: {
+                    create:
+                      q.options
+                  }
+                }
+              });
+            }
+
+            return tx.quiz.update({
+              where: {
+                id: quiz.id
+              },
+
+              data: {
+                status: 'DRAFT'
+              }
+            });
+          }
+        );
+
+      ok(
+        res,
+        result,
+        'All 10 questions saved',
+        201
+      );
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+
+app.patch(
+  '/api/admin/quizzes/:quizId/publish',
+  auth,
+  role(Role.ADMIN),
+  async (
+    req,
+    res,
+    next
+  ) => {
+    try {
+      const quiz =
+        await db.quiz.findUnique({
+          where: {
+            id: req.params.quizId
+          },
+
+          include: {
+            questions: {
+              include: {
+                options: true
+              }
+            }
+          }
+        });
+
+      if (!quiz)
+        return fail(
+          res,
+          'Quiz not found',
+          404
+        );
+
+      validateBuilderQuestions(
+        quiz.questions,
+        quiz.questionAnswerType,
+        quiz.timerMode
+      );
+
+      ok(
+        res,
+        await db.quiz.update({
+          where: {
+            id: quiz.id
+          },
+
+          data: {
+            status: 'PUBLISHED'
+          }
+        }),
+        'Quiz published'
+      );
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+
+app.get(
+  '/api/admin/quizzes/:quizId/preview',
+  auth,
+  role(Role.ADMIN),
+  async (
+    req,
+    res
+  ) => {
+    const quiz =
+      await db.quiz.findUnique({
+        where: {
+          id: req.params.quizId
+        },
+
+        include: {
+          questions: {
+            select: {
+              id: true,
+              questionText:
+                true,
+              marks: true,
+              questionTimeLimit:
+                true,
+
+              options: {
+                select: {
+                  id: true,
+                  optionText:
+                    true
+                }
+              }
+            }
+          }
+        }
+      });
+
+    quiz
+      ? ok(res, quiz)
+      : fail(
+          res,
+          'Quiz not found',
+          404
+        );
+  }
+);
+
+
+// ======================================================
+// ERROR HANDLER
+// ======================================================
+
+app.use(
+  (
+    e: any,
+    _q: Request,
+    res: Response,
+    _n: NextFunction
+  ) => {
+    if (
+      e instanceof z.ZodError
+    ) {
+      return fail(
+        res,
+        'Validation failed',
+        422,
+        e.flatten()
+      );
+    }
+
+    console.error(e);
+
+    return fail(
+      res,
+      e.code === 'P2002'
+        ? 'A record with this value already exists'
+        : e.message ||
+          'Internal server error',
+
+      e.message?.includes(
+        'not found'
+      )
+        ? 404
+        : 500
+    );
+  }
+);
+
+
+// ======================================================
+// EXPORT FOR VERCEL
+// ======================================================
+
+export default app;
